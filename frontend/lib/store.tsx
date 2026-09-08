@@ -91,7 +91,14 @@ const StoreContext = createContext<StoreContextValue | null>(null);
 const STAGE_SEQUENCE: JobStage[] = ["queued", "ingesting", "classifying", "analyzing", "generating", "completed"];
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<DemoState>(() => loadState());
+  const [state, setState] = useState<DemoState>(() => ({
+    user: null,
+    submissions: [],
+    jobs: [],
+    outputs: [],
+    auditLog: [],
+    referenceLibrary: SEED_REFERENCE_LIBRARY,
+  }));
   const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {

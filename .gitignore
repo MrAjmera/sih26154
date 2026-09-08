@@ -12,3 +12,6 @@ build/
 uploads/
 *.log
 .DS_Store
+
+Claude outputs/
+frontend/tsconfig.tsbuildinfo
