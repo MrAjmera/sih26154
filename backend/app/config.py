@@ -20,9 +20,14 @@ class Settings(BaseSettings):
     # LLM provider
     llm_provider: str = "gemini"
     google_api_key: str = ""
-    gemini_text_model: str = "gemini-2.5-flash"
+    gemini_text_model: str = "gemini-3.6-flash"
     gemini_embedding_model: str = "gemini-embedding-001"
     local_llm_base_url: str = "http://localhost:11434"
+    # When true (or when no API key is set), the LLM service returns canned
+    # responses instead of calling Gemini — for demos without network/quota.
+    llm_mock_mode: bool = False
+    llm_rate_limit_per_minute: int = 10
+    llm_rate_limit_per_day: int = 250
 
     # Uploads
     upload_dir: str = "/app/uploads"
