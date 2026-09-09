@@ -15,6 +15,18 @@ import {
   User,
 } from "./types";
 import { analyzeContext, classifySensitivity, pseudoHash, runGenerator } from "./mock-engine";
+import {
+  BACKEND_SUPPORTED_FORMATS,
+  checkBackendHealth,
+  createImageSubmission,
+  createTextSubmission,
+  fetchJob,
+  fetchOutputsForJob,
+  approveOutputApi,
+  verifyOutputChainApi,
+  isTerminalJobStatus,
+  startGeneration,
+} from "./api";
 
 const STORAGE_KEY = "sih26154_demo_state_v1";
 
@@ -25,6 +37,7 @@ interface DemoState {
   outputs: GeneratedOutput[];
   auditLog: AuditLogEntry[];
   referenceLibrary: ReferenceDocument[];
+  realJobIds: string[];
 }
 
 const DEMO_USERS: Record<Role, User> = {
@@ -54,32 +67,38 @@ const SEED_REFERENCE_LIBRARY: ReferenceDocument[] = [
 
 function loadState(): DemoState {
   if (typeof window === "undefined") {
-    return { user: null, submissions: [], jobs: [], outputs: [], auditLog: [], referenceLibrary: SEED_REFERENCE_LIBRARY };
+    return { user: null, submissions: [], jobs: [], outputs: [], auditLog: [], referenceLibrary: SEED_REFERENCE_LIBRARY, realJobIds: [] };
   }
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as DemoState;
-      return { ...parsed, referenceLibrary: parsed.referenceLibrary && parsed.referenceLibrary.length ? parsed.referenceLibrary : SEED_REFERENCE_LIBRARY };
+      return {
+        ...parsed,
+        referenceLibrary: parsed.referenceLibrary && parsed.referenceLibrary.length ? parsed.referenceLibrary : SEED_REFERENCE_LIBRARY,
+        realJobIds: parsed.realJobIds ?? [],
+      };
     }
   } catch {
     // ignore corrupted storage
   }
-  return { user: null, submissions: [], jobs: [], outputs: [], auditLog: [], referenceLibrary: SEED_REFERENCE_LIBRARY };
+  return { user: null, submissions: [], jobs: [], outputs: [], auditLog: [], referenceLibrary: SEED_REFERENCE_LIBRARY, realJobIds: [] };
 }
 
 interface StoreContextValue extends DemoState {
+  backendAvailable: boolean | null;
   login: (role: Role) => void;
   logout: () => void;
   submitContent: (args: {
     sourceType: SourceType;
     rawText: string;
+    imageFile?: File;
     params: GenerationParams;
     requestedFormats: FormatType[];
-  }) => { submissionId: string; jobId: string };
+  }) => Promise<{ submissionId: string; jobId: string } | null>;
   approveOutput: (outputId: string) => void;
   publishOutput: (outputId: string) => void;
-  verifyIntegrity: (jobId: string) => { ok: boolean; brokenAt: string[] };
+  verifyIntegrity: (jobId: string) => Promise<{ ok: boolean; brokenAt: string[] }>;
   addReferenceDocument: (doc: Omit<ReferenceDocument, "id" | "createdAt">) => void;
   getJob: (jobId: string) => Job | undefined;
   getOutputsForJob: (jobId: string) => GeneratedOutput[];
@@ -98,12 +117,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     outputs: [],
     auditLog: [],
     referenceLibrary: SEED_REFERENCE_LIBRARY,
+    realJobIds: [],
   }));
   const [hydrated, setHydrated] = useState(false);
+  const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null);
 
   useEffect(() => {
     setState(loadState());
     setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    checkBackendHealth().then((h) => setBackendAvailable(!!h));
   }, []);
 
   useEffect(() => {
@@ -142,14 +167,130 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setState((s) => ({ ...s, user: null }));
   }, []);
 
+  // Polls a real backend job until it reaches a terminal status, then pulls
+  // the generated outputs. Recursive setTimeout rather than setInterval so a
+  // slow request can't stack up overlapping polls.
+  const pollRealJob = useCallback(
+    (jobId: string, submissionId: string, user: User) => {
+      const tick = async () => {
+        const job = await fetchJob(submissionId, jobId);
+        if (!job) {
+          setTimeout(tick, 2000);
+          return;
+        }
+
+        setState((s) => ({
+          ...s,
+          jobs: s.jobs.map((j) =>
+            j.id === jobId ? { ...j, stage: job.stage, contextAnalysis: job.contextAnalysis ?? j.contextAnalysis } : j
+          ),
+        }));
+
+        if (!isTerminalJobStatus(job.status)) {
+          setTimeout(tick, 1500);
+          return;
+        }
+
+        const outputs = await fetchOutputsForJob(jobId);
+        setState((s) => ({
+          ...s,
+          outputs: outputs ? [...outputs, ...s.outputs.filter((o) => o.jobId !== jobId)] : s.outputs,
+          jobs: s.jobs.map((j) =>
+            j.id === jobId
+              ? {
+                  ...j,
+                  stage: job.status === "failed" ? "failed" : "completed",
+                  completedFormats: outputs ? outputs.map((o) => o.formatType) : j.completedFormats,
+                  completedAt: job.completedAt ?? new Date().toISOString(),
+                }
+              : j
+          ),
+        }));
+        pushAudit(
+          {
+            action: job.status === "failed" ? "job_failed" : "job_completed",
+            entityType: "job",
+            entityId: jobId,
+          },
+          user
+        );
+      };
+      setTimeout(tick, 400);
+    },
+    [pushAudit]
+  );
+
   const submitContent = useCallback(
-    (args: {
+    async (args: {
       sourceType: SourceType;
       rawText: string;
+      imageFile?: File;
       params: GenerationParams;
       requestedFormats: FormatType[];
-    }) => {
+    }): Promise<{ submissionId: string; jobId: string } | null> => {
       const user = state.user ?? DEMO_USERS.operator;
+
+      if (args.sourceType === "image" && !args.imageFile) {
+        // No offline path for image ingestion — it requires the real Gemini vision call.
+        return null;
+      }
+
+      if (backendAvailable) {
+        const supportedFormats = args.requestedFormats.filter((f) => BACKEND_SUPPORTED_FORMATS.includes(f));
+        if (supportedFormats.length === 0) {
+          // nothing the real backend can generate — fall through to mock demo below
+        } else {
+          const created =
+            args.sourceType === "image" && args.imageFile
+              ? await createImageSubmission(args.imageFile)
+              : await createTextSubmission(args.rawText, args.sourceType === "prompt" ? "prompt" : "text");
+
+          if (created) {
+            const started = await startGeneration(created.id, supportedFormats);
+            if (started) {
+              const submission: Submission = {
+                id: created.id,
+                userId: user.id,
+                sourceType: args.sourceType,
+                rawExcerpt: created.normalizedText.slice(0, 240),
+                normalizedText: created.normalizedText,
+                sensitivity: created.sensitivity,
+                sensitivityReasons: [],
+                params: args.params,
+                requestedFormats: supportedFormats,
+                createdAt: created.createdAt,
+              };
+              const job: Job = {
+                id: started.jobId,
+                submissionId: created.id,
+                stage: "queued",
+                requestedFormats: supportedFormats,
+                completedFormats: [],
+                createdAt: new Date().toISOString(),
+              };
+
+              setState((s) => ({
+                ...s,
+                submissions: [submission, ...s.submissions],
+                jobs: [job, ...s.jobs],
+                realJobIds: [started.jobId, ...s.realJobIds],
+              }));
+              pushAudit({ action: "submission_created", entityType: "submission", entityId: created.id }, user);
+              pushAudit({ action: "job_enqueued", entityType: "job", entityId: started.jobId }, user);
+
+              pollRealJob(started.jobId, created.id, user);
+              return { submissionId: created.id, jobId: started.jobId };
+            }
+          }
+          // backend reachable but this call failed (e.g. bad upload) — fall through to mock
+        }
+      }
+
+      if (args.sourceType === "image") {
+        // No offline path for image ingestion — it requires the real Gemini vision call.
+        return null;
+      }
+
       const { level, reasons } = classifySensitivity(args.rawText);
       const submissionId = `sub-${Date.now()}`;
       const jobId = `job-${Date.now()}`;
@@ -187,13 +328,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
 
       pushAudit({ action: "job_enqueued", entityType: "job", entityId: jobId }, user);
-      runPipeline(jobId, submission, user);
+      runMockPipeline(jobId, submission, user);
       return { submissionId, jobId };
     },
-    [state.user, pushAudit]
+    [state.user, backendAvailable, pushAudit, pollRealJob]
   );
 
-  const runPipeline = useCallback(
+  const runMockPipeline = useCallback(
     (jobId: string, submission: Submission, user: User) => {
       let stageIdx = 0;
       const advance = () => {
@@ -262,6 +403,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const approveOutput = useCallback(
     (outputId: string) => {
       const user = state.user;
+      const output = state.outputs.find((o) => o.id === outputId);
+      const isReal = output && state.realJobIds.includes(output.jobId);
+
+      if (isReal) {
+        approveOutputApi(outputId).then((updated) => {
+          if (!updated) return;
+          setState((s) => ({
+            ...s,
+            outputs: s.outputs.map((o) => (o.id === outputId ? updated : o)),
+          }));
+          pushAudit({ action: "output_approved", entityType: "generated_output", entityId: outputId }, user);
+        });
+        return;
+      }
+
       setState((s) => ({
         ...s,
         outputs: s.outputs.map((o) =>
@@ -272,11 +428,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }));
       pushAudit({ action: "output_approved", entityType: "generated_output", entityId: outputId });
     },
-    [state.user, pushAudit]
+    [state.user, state.outputs, state.realJobIds, pushAudit]
   );
 
   const publishOutput = useCallback(
     (outputId: string) => {
+      // No backend "publish" endpoint exists yet — this is local-only for both
+      // real and mock outputs.
       setState((s) => ({
         ...s,
         outputs: s.outputs.map((o) => (o.id === outputId ? { ...o, status: "published" } : o)),
@@ -287,7 +445,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   );
 
   const verifyIntegrity = useCallback(
-    (jobId: string) => {
+    async (jobId: string): Promise<{ ok: boolean; brokenAt: string[] }> => {
+      if (state.realJobIds.includes(jobId)) {
+        const jobOutputs = state.outputs.filter((o) => o.jobId === jobId);
+        const anchor = jobOutputs[0];
+        if (anchor) {
+          const result = await verifyOutputChainApi(anchor.id);
+          if (result) {
+            pushAudit({ action: "integrity_verified", entityType: "job", entityId: jobId });
+            return { ok: result.ok, brokenAt: result.broken_at };
+          }
+        }
+      }
+
       const jobOutputs = state.outputs.filter((o) => o.jobId === jobId).slice().reverse();
       let previousHash = pseudoHash(`genesis-${jobId}`);
       const brokenAt: string[] = [];
@@ -301,7 +471,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       pushAudit({ action: "integrity_verified", entityType: "job", entityId: jobId });
       return { ok: brokenAt.length === 0, brokenAt };
     },
-    [state.outputs, pushAudit]
+    [state.outputs, state.realJobIds, pushAudit]
   );
 
   const addReferenceDocument = useCallback((doc: Omit<ReferenceDocument, "id" | "createdAt">) => {
@@ -328,6 +498,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<StoreContextValue>(
     () => ({
       ...state,
+      backendAvailable,
       login,
       logout,
       submitContent,
@@ -339,7 +510,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       getOutputsForJob,
       getSubmission,
     }),
-    [state, login, logout, submitContent, approveOutput, publishOutput, verifyIntegrity, addReferenceDocument, getJob, getOutputsForJob, getSubmission]
+    [
+      state,
+      backendAvailable,
+      login,
+      logout,
+      submitContent,
+      approveOutput,
+      publishOutput,
+      verifyIntegrity,
+      addReferenceDocument,
+      getJob,
+      getOutputsForJob,
+      getSubmission,
+    ]
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

@@ -152,7 +152,7 @@ export default function JobDetailPage() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setVerifyResult(verifyIntegrity(job.id))}
+                onClick={async () => setVerifyResult(await verifyIntegrity(job.id))}
               >
                 <Fingerprint className="h-4 w-4" /> Verify hash-chain integrity
               </Button>

@@ -88,6 +88,8 @@ async def _generate_formats(job_id: uuid.UUID) -> None:
 
         except Exception as exc:  # noqa: BLE001 - job-level failure must still be recorded
             logger.exception("generate_formats failed for job %s", job_id)
+            await db.rollback()
+            job = await db.get(Job, job_id)
             job.status = "failed"
             job.error = str(exc)
             await db.commit()

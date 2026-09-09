@@ -29,7 +29,8 @@ import {
   SourceType,
   Tone,
 } from "@/lib/types";
-import { ArrowRight, FileText, Image as ImageIcon, Sparkles, Video, MessageSquareText } from "lucide-react";
+import { BACKEND_SUPPORTED_FORMATS } from "@/lib/api";
+import { ArrowRight, FileText, Image as ImageIcon, Sparkles, Video, MessageSquareText, Upload } from "lucide-react";
 
 const SAMPLE_SOURCE = `A coordinated phishing campaign impersonating the National Cyber Coordination Portal has been detected targeting government employees. The emails contain a malicious link disguised as a mandatory password-reset notice. Approximately 1,200 mailboxes across three departments received the message in the last 24 hours. IT Security has already blocked the sender domain and is asking all staff to avoid clicking unexpected password-reset links and to report suspicious emails to the SOC helpdesk immediately.`;
 
@@ -63,7 +64,7 @@ const stageColor: Record<Job["stage"], "default" | "secondary" | "destructive" |
 };
 
 export default function DashboardPage() {
-  const { user, submissions, jobs, submitContent } = useStore();
+  const { user, submissions, jobs, submitContent, backendAvailable } = useStore();
   const router = useRouter();
 
   useEffect(() => {
@@ -72,14 +73,16 @@ export default function DashboardPage() {
 
   const [sourceType, setSourceType] = useState<SourceType>("text");
   const [rawText, setRawText] = useState(SAMPLE_SOURCE);
+  const [imageFile, setImageFile] = useState<File | null>(null);
   const [audience, setAudience] = useState("Government employees & department IT leads");
   const [tone, setTone] = useState<Tone>("urgent");
   const [language, setLanguage] = useState<Language>("English");
   const [detailLevel, setDetailLevel] = useState<DetailLevel>("standard");
   const [objective, setObjective] = useState<Objective>("warn");
   const [contentStyle, setContentStyle] = useState("Plain-language security advisory");
-  const [selectedFormats, setSelectedFormats] = useState<FormatType[]>(["advisory", "linkedin", "exec_summary"]);
+  const [selectedFormats, setSelectedFormats] = useState<FormatType[]>(["advisory", "linkedin"]);
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   if (!user) return null;
 
@@ -87,12 +90,26 @@ export default function DashboardPage() {
     setSelectedFormats((prev) => (prev.includes(f) ? prev.filter((x) => x !== f) : [...prev, f]));
   };
 
-  const handleSubmit = () => {
-    if (!rawText.trim() || selectedFormats.length === 0) return;
+  const hasContent = sourceType === "image" ? !!imageFile : !!rawText.trim();
+
+  const handleSubmit = async () => {
+    if (!hasContent || selectedFormats.length === 0) return;
     setSubmitting(true);
+    setSubmitError(null);
     const params: GenerationParams = { audience, tone, language, detailLevel, objective, contentStyle };
-    const { jobId } = submitContent({ sourceType, rawText, params, requestedFormats: selectedFormats });
-    setTimeout(() => router.push(`/dashboard/jobs/${jobId}`), 150);
+    const result = await submitContent({
+      sourceType,
+      rawText,
+      imageFile: imageFile ?? undefined,
+      params,
+      requestedFormats: selectedFormats,
+    });
+    setSubmitting(false);
+    if (result) {
+      router.push(`/dashboard/jobs/${result.jobId}`);
+    } else {
+      setSubmitError("Submission failed — the backend may be unreachable or the upload was rejected. Try again.");
+    }
   };
 
   return (
@@ -136,11 +153,42 @@ export default function DashboardPage() {
                 rows={9}
                 placeholder="Paste the source content or describe what you need..."
               />
+            ) : sourceType === "image" ? (
+              backendAvailable ? (
+                <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+                  <input
+                    id="image-upload"
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
+                    className="hidden"
+                    onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
+                  />
+                  <label
+                    htmlFor="image-upload"
+                    className="flex cursor-pointer flex-col items-center gap-2 text-primary hover:underline"
+                  >
+                    <Upload className="h-5 w-5" />
+                    {imageFile ? imageFile.name : "Choose an image to upload"}
+                  </label>
+                  <p className="mt-2 text-xs">
+                    Sent to Gemini vision for a factual description, which becomes the normalized source text.
+                  </p>
+                </div>
+              ) : (
+                <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+                  Image ingestion needs the live backend (Gemini vision) — it&apos;s unreachable right now, so this
+                  demo is running on the offline mock engine, which doesn&apos;t support images.
+                  <div className="mt-3">
+                    <Button size="sm" variant="outline" onClick={() => setSourceType("text")}>
+                      Use text input instead
+                    </Button>
+                  </div>
+                </div>
+              )
             ) : (
               <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-                {sourceType === "document" && "Document upload (PDF/DOCX parsed via pymupdf/python-docx) — for this demo, switch to Text and paste the extracted content."}
-                {sourceType === "image" && "Image upload (sent to Gemini Files API for description) — for this demo, switch to Text and describe the image content."}
-                {sourceType === "video" && "Video upload (sent to Gemini Files API for transcription) — for this demo, switch to Text and paste the transcript/summary."}
+                {sourceType === "document" && "Document upload (PDF/DOCX parsed via pymupdf/python-docx) isn't wired up yet — switch to Text and paste the extracted content."}
+                {sourceType === "video" && "Video upload (sent to Gemini for transcription) isn't wired up yet — switch to Text and paste the transcript/summary."}
                 <div className="mt-3">
                   <Button size="sm" variant="outline" onClick={() => setSourceType("text")}>
                     Use text input instead
@@ -149,8 +197,11 @@ export default function DashboardPage() {
               </div>
             )}
             <p className="text-xs text-muted-foreground">
-              Every submission is scanned by the sensitivity classifier before it reaches any LLM provider — try
-              adding a word like &ldquo;classified&rdquo; to see it get flagged or blocked.
+              {backendAvailable === null
+                ? "Checking backend connection…"
+                : backendAvailable
+                ? "Connected to the live backend — submissions run through the real context analyzer and format generators (Gemini). Sensitivity classification isn't built yet, so every submission currently comes back \"clear.\""
+                : "Backend unreachable — running on the offline demo engine. Every submission is scanned by a simulated sensitivity classifier before \"reaching\" any LLM provider; try adding a word like “classified” to see it get flagged or blocked."}
             </p>
           </CardContent>
         </Card>
@@ -221,31 +272,44 @@ export default function DashboardPage() {
       <Card className="mt-6">
         <CardHeader>
           <CardTitle>3. Select output formats</CardTitle>
-          <CardDescription>One source, generated into every format you pick, concurrently.</CardDescription>
+          <CardDescription>
+            One source, generated into every format you pick, concurrently.
+            {backendAvailable && " Only Advisory and LinkedIn Post are wired to a real generator so far — the rest are mock-only."}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {ALL_FORMATS.map((f) => (
-              <label
-                key={f}
-                className={`flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors ${
-                  selectedFormats.includes(f) ? "border-primary bg-primary/5" : "border-input"
-                }`}
-              >
-                <Checkbox checked={selectedFormats.includes(f)} onCheckedChange={() => toggleFormat(f)} />
-                {FORMAT_LABELS[f]}
-              </label>
-            ))}
+            {ALL_FORMATS.map((f) => {
+              const unsupportedLive = !!backendAvailable && !BACKEND_SUPPORTED_FORMATS.includes(f);
+              return (
+                <label
+                  key={f}
+                  className={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors ${
+                    unsupportedLive ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                  } ${selectedFormats.includes(f) ? "border-primary bg-primary/5" : "border-input"}`}
+                  title={unsupportedLive ? "No real generator for this format yet" : undefined}
+                >
+                  <Checkbox
+                    checked={selectedFormats.includes(f)}
+                    disabled={unsupportedLive}
+                    onCheckedChange={() => !unsupportedLive && toggleFormat(f)}
+                  />
+                  {FORMAT_LABELS[f]}
+                  {unsupportedLive && <span className="text-[10px] text-muted-foreground">(not built)</span>}
+                </label>
+              );
+            })}
           </div>
           <Separator className="my-4" />
           <div className="flex items-center justify-between">
             <p className="text-sm text-muted-foreground">
               {selectedFormats.length} format{selectedFormats.length === 1 ? "" : "s"} selected
             </p>
-            <Button onClick={handleSubmit} disabled={submitting || !rawText.trim() || selectedFormats.length === 0}>
-              Run pipeline <ArrowRight className="h-4 w-4" />
+            <Button onClick={handleSubmit} disabled={submitting || !hasContent || selectedFormats.length === 0}>
+              {submitting ? "Running…" : "Run pipeline"} <ArrowRight className="h-4 w-4" />
             </Button>
           </div>
+          {submitError && <p className="mt-2 text-sm text-red-600">{submitError}</p>}
         </CardContent>
       </Card>
 

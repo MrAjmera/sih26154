@@ -38,6 +38,11 @@ class LLMProvider(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    async def describe_image(self, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+        """Return a text description of the given image, grounded by prompt."""
+        raise NotImplementedError
+
 
 class _SlidingWindowRateLimiter:
     """Enforces N calls per minute and N calls per day, in-process.
@@ -93,7 +98,14 @@ class GeminiProvider(LLMProvider):
             response_schema=response_schema,
             temperature=0.4,
         )
+        return await self._call(prompt, config)
 
+    async def describe_image(self, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+        config = types.GenerateContentConfig(response_mime_type="text/plain", temperature=0.4)
+        contents = [types.Part.from_bytes(data=image_bytes, mime_type=mime_type), prompt]
+        return await self._call(contents, config)
+
+    async def _call(self, contents, config: "types.GenerateContentConfig") -> str:
         last_error: Optional[Exception] = None
         for attempt in range(self._max_retries + 1):
             await self._limiter.acquire()
@@ -101,7 +113,7 @@ class GeminiProvider(LLMProvider):
                 response = await asyncio.wait_for(
                     self._client.aio.models.generate_content(
                         model=self._model,
-                        contents=prompt,
+                        contents=contents,
                         config=config,
                     ),
                     timeout=self._timeout_seconds,
@@ -138,6 +150,13 @@ class MockProvider(LLMProvider):
         if response_schema is not None:
             return json.dumps(_mock_json_for_schema(response_schema, prompt))
         return _mock_free_text(prompt)
+
+    async def describe_image(self, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+        await asyncio.sleep(0)
+        return (
+            f"[Mock-mode image description — {len(image_bytes)} bytes, {mime_type}. "
+            "No Gemini call was made. Set a real GOOGLE_API_KEY to get an actual description.]"
+        )
 
 
 def _mock_json_for_schema(schema: dict, prompt: str) -> dict:

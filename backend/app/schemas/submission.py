@@ -27,3 +27,18 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     job_id: uuid.UUID
     status: str
+
+
+class JobOut(BaseModel):
+    job_id: uuid.UUID = Field(validation_alias="id")
+    submission_id: uuid.UUID
+    status: str
+    requested_formats: list[str]
+    context_analysis: dict | None
+    error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
